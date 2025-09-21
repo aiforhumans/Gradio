@@ -1,48 +1,123 @@
 # Copilot Instructions for this Repo
 
-This repo contains a minimal Gradio chat app with two ways to run it: (a) a toy streaming chatbot in `app.py`, and (b) an Agents UI (`agents/ui.py`) that routes messages to pluggable agents like Echo and a local DMR-backed LLM. Keep changes small, runnable, and verified.
+This repo contains a Gradio chat application with Docker Model Runner (DMR) integration via Pydantic AI and OpenAI-compatible API. Keep edits focused, tested, and maintain the streaming chat patterns with structured output validation.
 
-## Architecture & Layout
-- `app.py` — self-contained demo using `gr.Blocks` + `gr.Chatbot(type="messages")`. It streams characters from a random reply via a generator function and calls `demo.launch()` at the bottom.
-- `agents/ui.py` — reusable Blocks UI (not launched on import) with an Agent dropdown, `Chatbot(type="messages")`, and a `chat_response` router that calls the selected agent.
-- `agents/__init__.py` — central registry: `AGENTS = {"Echo": echo.respond, "DMR Chat": dmr_chat.respond}`.
-- `agents/echo.py` — offline echo agent: `def respond(message: str, history: list[dict]) -> str` returns the message.
-- `agents/dmr_chat.py` — OpenAI SDK client pointed at DMR; env-configurable (`OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL`). Sends `history + latest user` to `chat.completions.create()` and returns the model message; exceptions are caught and returned as a friendly `"Error: ..."` string.
-- `requirements.txt` — deps: `gradio`, `openai`.
-- `guides/` — upstream Gradio docs index; useful references, not required by the app.
+## Architecture & Data Flow
 
-Data flow (Agents UI)
-User → `(message, history)` → `chat_response()` → `AGENTS[agent_name](message, history)` → string reply → appended/rendered in `gr.Chatbot`.
+- `app.py` — Single-file Gradio app with tabbed interface (Chat + Settings) that connects to DMR via Pydantic AI agents
+- **Chat Tab**: `gr.Chatbot(type="messages")` with streaming responses from DMR models using structured output
+- **Settings Tab**: Dynamic model dropdown + environment variable configuration
+- **Data Flow**: User message → `user()` function → `bot()` creates Pydantic AI agent → structured response → character streaming → UI updates
 
-## Conventions & Patterns
-- Always use `type="messages"` for chat UIs; history items are `{ "role": "user"|"assistant", "content": str }`.
-- Agent contract: `respond(message: str, history: list[dict]) -> str`.
-- Streaming pattern: yield incremental histories (see `app.py`'s `bot()`); non-streaming agents return a final string.
-- Queueing is optional here; enable `.queue()` for long/parallel LLM calls when you wire up a launcher (not used in current files).
+## Core Patterns
 
-## Developer Workflows (Windows PowerShell)
-- Python 3.11+ recommended. Create venv and install deps, then run the toy demo:
-  - `python app.py`
-- Launch the Agents UI without editing files:
-  - `python -c "from agents.ui import demo; demo.launch()"`
-- Bind host/port explicitly if needed:
-  - `$env:GRADIO_SERVER_NAME = '127.0.0.1'`; optionally `$env:GRADIO_SERVER_PORT = '7860'`.
-- Configure DMR via env vars (defaults in `agents/dmr_chat.py`):
-  - `$env:OPENAI_BASE_URL = 'http://localhost:12434/engines/v1'`
-  - `$env:OPENAI_API_KEY = 'dmr'`
-  - `$env:OPENAI_MODEL = 'ai/gemma3'`
+### Message Format
+Always use `type="messages"` for chatbots. History format: `[{"role": "user|assistant|system", "content": str}, ...]`
 
-## Add a New Agent (example)
-1) Create `agents/my_agent.py` with `def respond(message: str, history: list[dict]) -> str: ...`
-2) Register in `agents/__init__.py`: `AGENTS["My Agent"] = my_agent.respond`
-3) It appears in the dropdown in `agents/ui.py` automatically.
+### Pydantic AI Agent Pattern
+```python
+from pydantic_ai import Agent
+from pydantic_ai.models.openai import OpenAIProvider
 
-## Guardrails
-- Keep modules importable; only call `.launch()` in a runner (e.g., `app.py` or a `python -c` one-liner). Avoid side-effects on import.
-- Add dependencies via `requirements.txt` only. Keep PRs minimal and runnable.
+class ChatResponse(BaseModel):
+    message: str = Field(description="The response message to the user")
+
+def create_dmr_agent():
+    provider = OpenAIProvider(
+        api_key=os.getenv("OPENAI_API_KEY", "dmr"),
+        base_url=os.getenv("OPENAI_BASE_URL", "http://localhost:12434/engines/v1")
+    )
+    
+    return Agent(
+        model=provider.get_model(os.getenv("OPENAI_MODEL", "ai/gemma3")),
+        result_type=ChatResponse,
+        system_prompt="You are a helpful AI assistant..."
+    )
+```
+
+### Streaming Implementation with Structured Output
+```python
+def bot(history: list[dict]):
+    # Add empty assistant message first
+    history.append({"role": "assistant", "content": ""})
+    
+    # Create agent and get structured response
+    agent = create_dmr_agent()
+    result = agent.run_sync(user_message)
+    
+    # Extract message and stream character by character
+    response_text = result.output.message
+    for i in range(len(response_text)):
+        history[-1]["content"] = response_text[:i+1]
+        yield history
+        time.sleep(0.01)  # Streaming effect
+```
+
+### DMR Integration
+- **Base URL**: `http://localhost:12434/engines/v1` (host) or `http://model-runner.docker.internal/engines/v1` (containers)
+- **API Key**: Use `"dmr"` (any non-empty string works)
+- **Models**: Format `ai/model-name` (e.g., `ai/gemma3`, `ai/qwen2.5`, `ai/smollm2`, `ai/llama3.2`)
+- **Provider**: OpenAIProvider abstracts DMR connection for Pydantic AI
+- **Error Handling**: Robust validation with fallback to error messages instead of crashes
+
+### Environment Configuration
+Settings persist via `os.environ` and are configurable through the Settings tab:
+- `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL`
+- Dynamic model refresh fetches available models from DMR `/models` endpoint
+- Agent recreation on settings change: `save_settings()` recreates global agent
+
+## Development Workflows
+
+### Run & Debug
+```powershell
+python app.py  # Launches with debug=True and logging.INFO
+```
+- Terminal shows HTTP requests to DMR endpoints
+- Gradio serves on `http://127.0.0.1:7861` with live reloading
+- Pydantic AI validation errors appear in logs
+
+### Key Functions
+- `create_dmr_agent()` — Factory for Pydantic AI agents with current environment
+- `user()` — Appends user message, clears input
+- `bot()` — Creates agent, gets structured response, streams to UI
+- `get_available_models()` — Fetches live models from DMR with ai/ filtering
+- `save_settings()` — Persists config and recreates agent
+
+## Structured Output Design
+
+### ChatResponse Model
+```python
+class ChatResponse(BaseModel):
+    message: str = Field(description="The response message to the user")
+```
+- Ensures type safety and validation
+- Extensible for future structured features (metadata, tool calls, etc.)
+- Pydantic AI automatically validates against schema
+
+### Agent Configuration
+- **Result Type**: Always use `result_type=ChatResponse` for structured output
+- **System Prompt**: Configurable via agent creation
+- **Model Selection**: Dynamic via OpenAIProvider.get_model()
+- **Error Recovery**: Agent recreation on configuration errors
+
+## Critical Details
+- Enable queueing: `.queue().launch()` for streaming support
+- Agent recreation: Always recreate agent when settings change to pick up new config
+- Character streaming: Use `time.sleep(0.01)` for smooth streaming effect
+- Settings changes apply immediately via environment variables + agent recreation
+- Height management: `height="80vh"` keeps chat area sized properly
+- Model filtering: Prefer `ai/` prefixed models for DMR compatibility
 
 ## Troubleshooting
-- If `python app.py` exits quickly with code 1, it’s often an interrupted foreground run. Re-run and check PowerShell env vars.
-- If DMR isn’t running on `:12434`, `DMR Chat` will return an `Error: ...` string in the chat instead of crashing the UI.
+- DMR connection errors show friendly messages in chat instead of crashing
+- Model dropdown falls back to defaults if DMR unavailable
+- Pydantic AI validation errors logged but don't crash the interface
+- Agent recreation failures handled gracefully with error messages
+- Logging enabled shows request/response flow and validation issues for debugging
 
-Questions or gaps? Open an issue and propose a tiny change set to evolve these rules.
+## Migration Notes (from direct OpenAI SDK)
+- Replace direct OpenAI client calls with Pydantic AI agents
+- Add structured output models (ChatResponse) for type safety
+- Use OpenAIProvider instead of direct OpenAI client initialization
+- Character-based streaming replaces chunk-based streaming
+- Agent recreation replaces client recreation for settings changes
